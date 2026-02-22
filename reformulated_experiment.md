@@ -60,13 +60,13 @@ A pure steady-state solver assumes infinite time at reduced aeration and ignores
 
 Instead use a **Pseudo-Dynamic Step-Response Simulation**:
 
-1. Initialize at nominal steady state
+1. Initialize at nominal aeration parameters
 2. Apply influent snapshot
 3. Reduce aeration
-4. Run dynamic ODE solver only for duration *t*
+4. Run steady state ODE solver for the new aeration levels
 5. Record effluent at end of event
 
-This captures buffering via ASM3 storage compounds and HRT effects .
+This captures buffering via ASM3 storage compounds and HRT effects.
 
 ---
 

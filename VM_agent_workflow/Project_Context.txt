@@ -1,0 +1,650 @@
+## 1. Project Context
+
+### 1.1 Objective
+
+Design and implement a **Dynamic Step-Response Simulation** framework that systematically varies influent loading conditions and aeration curtailment levels across an ASM3 wastewater treatment benchmark model (Simulink steady-state solver) to produce a comprehensive training database for risk-energy optimization modeling.
+
+### 1.2 What the Framework Produces
+
+A structured dataset where each row represents one complete step-response cycle:
+
+```
+[Influent Conditions] × [Aeration Profile] → [Baseline] → [Curtailment Response] → [Recovery] → [Derived Metrics]
+```
+
+The database captures: how the plant responds to aeration curtailment under different loading conditions, how much energy is saved, how much effluent quality degrades, and whether the plant recovers to baseline after restoring nominal aeration.
+
+### 1.3 Architecture — Responsibility Boundary
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  PYTHON LAYER — Orchestrator / CRUD / Data Analysis / ML         │
+│                                                                  │
+│  ✓ Influent percentile matrix generation (statistical sampling)  │
+│  ✓ Aeration reduction profile grid generation (parameter sweep)  │
+│  ✓ YAML config management                                        │
+│  ✓ MATLAB engine invocation and sequencing                       │
+│  ✓ Output data collection, assembly, and storage (CSV/Parquet)   │
+│  ✓ Derived metric computation (damage indices, energy ratios)    │
+│  ✓ Future: ML model training on assembled database               │
+│                                                                  │
+│  ✗ NEVER: ODE solving, biological kinetics, COD fractionation,   │
+│           reactor mass balances, settling physics, or any        │
+│           calculation that belongs to the ASM3 model             │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │ file-based interface (.mat files in, .csv/.mat out)
+┌──────────────────────────▼───────────────────────────────────────┐
+│  MATLAB LAYER — Simulink Model Execution                         │
+│                                                                  │
+│  ✓ benchmarkinit / benchmarkss / stateset (model lifecycle)      │
+│  ✓ Steady-state ODE integration via Simulink solver              │
+│  ✓ Settler model physics                                         │
+│  ✓ ASM3 biological process calculations                          │
+│  ✓ COD fractionation and sCOD computation                        │
+│  ✓ Aeration energy calculation                                   │
+│  ✓ State variable capture and workspace management               │
+│  ✓ Per-iteration data writing (settler output, energy, sCOD)     │
+│                                                                  │
+│  Pattern: clear all → reload from .mat → run → save → repeat     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Critical boundary rule:** Every number that comes out of the Simulink model is produced by MATLAB. Python only performs arithmetic on MATLAB's outputs (ratios, differences, normalization) — never on raw state variables or biological parameters.
+
+### 1.4 COD Fractionation — Boundary Clarification
+
+The sCOD calculation (referenced in `perf_plant_LT_DR.m` line 129) uses ASM3 stoichiometric COD conversion factors applied to settler effluent state variables. This is a **model-coupled calculation** — the coefficients are ASM3 parameters, not generic arithmetic. Therefore:
+
+- **sCOD computation stays in MATLAB.** The MATLAB data writer must output sCOD as a pre-computed value alongside settler concentrations.
+- **Damage indices and energy ratios are computed in Python.** These are simple ratios of MATLAB outputs: `(experimental - nominal) / limit_or_nominal`. They require no model knowledge beyond the output values and regulatory limits.
+
+---
+
+## 2. The Step-Response Protocol
+
+Each experimental cycle consists of three sequential steady-state simulations sharing the same influent condition. This is the atomic unit of the database.
+
+```
+│  STEP A:     │     │  STEP B:          │     │  STEP C:     │
+│  BASELINE    │────▶│  CURTAILMENT      │────▶│  RECOVERY    │
+│              │     │                    │     │              │
+│  Nominal KLa │     │  Reduced KLa      │     │  Nominal KLa │
+│  Influent Pₖ │     │  Same Influent Pₖ  │     │  Same Pₖ     │
+│  → SS solve  │     │  → SS solve        │     │  → SS solve  │
+│  → Baseline  │     │  → Experimental    │     │  → Recovery  │
+│    outputs   │     │    outputs         │     │    outputs   │
+```
+
+**Step A — Baseline:** Initialize model with `benchmarkinit`, set nominal aeration (KLa1=KLa2=0, KLa3=KLa4=240, KLa5=110), load influent percentile vector into `exp_influentQ.mat`, run `benchmarkss` to convergence. Save state and record settler output as baseline.
+
+**Step B — Curtailment:** From Step A's converged state, apply reduced KLa3/KLa4/KLa5 values. Run `benchmarkss` to convergence. Record settler output, energy, and sCOD as experimental values.
+
+**Step C — Recovery:** From Step B's converged state, restore nominal KLa values. Same influent. Run `benchmarkss` to convergence. Record settler output as recovery values. Run `benchmarkinit` to clear workspace for next cycle.
+
+### 2.1 Workspace Survival Pattern
+
+The existing `ssASM3_DR_datagen.m` demonstrates the proven pattern for surviving `benchmarkinit`'s workspace destruction:
+
+```matlab
+while true
+    clear all;                    % Nuclear option — wipe everything
+    load('sim_config.mat');       % Restore immutable experiment config
+    load('sim_state.mat');        % Restore mutable iteration state
+    if iter > num_iterations      % Check completion
+        break;
+    end
+    benchmarkinit;                % Initialize model (clears workspace again)
+    load('sim_config.mat');       % Restore AGAIN after benchmarkinit
+    load('sim_state.mat');        % Restore AGAIN
+    % ... extract parameters, configure model, simulate, save data ...
+    iter = iter + 1;
+    save('sim_state.mat', 'iter');
+end
+```
+
+This pattern MUST be preserved in the refactored script. The two-phase reload (before and after `benchmarkinit`) is not redundant — it is the core robustness mechanism.
+
+### 2.2 Convergence & StopTime Strategy
+
+The existing code scales StopTime with aeration reduction severity (200 iterations at nominal → 2000 iterations at heavy reduction). This reflects the physical reality that more reduced aeration requires longer to reach a new steady state.
+
+**Proposed approach:** Define StopTime as a function of the maximum aeration reduction factor:
+
+```
+reduction_factor = min(KLa3/KLa3_nom, KLa4/KLa4_nom, KLa5/KLa5_nom)
+StopTime = base_time + scale_factor × (1 - reduction_factor)
+```
+
+Where `base_time` (for nominal) and `scale_factor` (for maximum reduction) are config parameters. The existing code suggests `base_time ≈ 200` and the maximum around `2000` at ~57% reduction of the most-reduced parameter.
+
+---
+
+## 3. Experiment Parameter Space
+
+### 3.1 Influent Variability — Percentile Matrix
+
+**Source data:** `ASM3_Input` matrix — 21 columns (col 1 = time, cols 2–14 = water quality, col 15 = Q, col 16 = temperature, cols 17–21 = dummy variables).
+
+**Sampling strategy:**
+
+1. Compute percentiles (10th, 25th, 50th, 75th, 90th) of the Q vector (column 15).
+2. For each Q percentile, identify the timesteps where Q falls nearest to that percentile value.
+3. At those timesteps, extract the corresponding water quality parameters (cols 2–14) and temperature (col 16).
+4. Average across the identified timesteps to produce one representative influent vector per Q percentile.
+5. Format each vector to match `CONSTINFLUENT.mat` structure (2-row matrix with identical rows, 21 columns).
+
+**Output:** 5 influent condition files, one per percentile, each in `CONSTINFLUENT.mat` format.
+
+**Responsibility:** Python generates these files. No biological interpretation — purely statistical sampling and matrix formatting.
+
+### 3.2 Aeration Reduction Profiles
+
+**Nominal values** (from experiment plan): KLa3 = 240, KLa4 = 240, KLa5 = 110.
+
+**Reduction constraint:** Minimum 50% of nominal for each parameter.
+
+**Reduction structure:** The existing code applies a proportional reduction across all three tanks (KLa3 and KLa4 share a factor; KLa5 tracks proportionally at its own nominal). The experiment plan says "Numerous different reduced aeration profiles" which suggests systematic coverage of the reduction space.
+
+**Proposed grid — Proportional reduction with a single factor:**
+
+```
+reduction_factors = [1.0, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50]
+
+For each factor f:
+    KLa3 = 240 × f
+    KLa4 = 240 × f
+    KLa5 = 110 × f
+```
+
+This yields 11 aeration profiles (including the nominal baseline at f=1.0).
+
+**Open question for review:** Should KLa3/KLa4/KLa5 vary independently? Independent variation of 3 parameters at 11 levels would produce 1,331 profiles — likely excessive for steady-state simulation. The proportional approach covers the reduction axis with 11 profiles. A compromise (e.g., vary KLa5 independently while keeping KLa3=KLa4 tied) could be a Phase 2 extension.
+
+### 3.3 Total Experiment Size
+
+```
+5 influent percentiles × 11 aeration profiles × 3 steps per cycle = 165 steady-state simulations
+```
+
+Each simulation produces one row of settler output + energy + sCOD. The assembled database has 55 complete cycles (5 × 11), each with baseline/curtailment/recovery triplets.
+
+---
+
+## 4. Configuration Strategy
+
+### 4.1 YAML Config Structure
+
+```yaml
+# config.yaml — ASM3 Aeration Reliability Experiment Configuration
+
+paths:
+  working_dir: "./ASM3"
+  output_dir: "./ASM3_Output/reliability_data"
+  influent_source: "./ASM3/ASM3_Input.mat"
+  influent_output_dir: "./ASM3/influent_percentiles"
+  backup_root: "./Databases/StepResponse"
+
+models:
+  steady_state: "benchmarkss"
+
+nominal_aeration:
+  KLa1: 0
+  KLa2: 0
+  KLa3: 240
+  KLa4: 240
+  KLa5: 110
+
+experiment:
+  influent_percentiles: [10, 25, 50, 75, 90]
+  influent_wq_columns: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]  # Water quality
+  influent_Q_column: 15
+  influent_temp_column: 16
+  influent_total_columns: 21
+  reduction_factors: [1.0, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50]
+  min_reduction: 0.50  # Hard floor — no factor below this
+
+convergence:
+  solver: "ode15s"
+  min_simulink_iterations: 200
+  max_simulink_iterations: 1000
+
+regulatory_limits:
+  COD_limit: 100            # mg/L — for damage index calculation
+  NH4_limit: 4              # mg/L — for damage index calculation
+
+output:
+  dataset_filename: "reliability_ss_dataset.csv"
+  include_baseline: true
+  include_recovery: true
+```
+
+### 4.2 Config Loading
+
+- **Python:** `yaml.safe_load()` with `pathlib.Path` resolution.
+- **MATLAB:** Config values are written into `sim_config.mat` by the Python orchestrator before MATLAB invocation. MATLAB reads `sim_config.mat` — no YAML parsing needed on the MATLAB side. This keeps the MATLAB script focused on simulation.
+
+---
+
+## 5. Developer Agent Prompt — Detailed Specification
+
+### 5.1 Deliverables
+
+|#|File|Language|Purpose|
+|---|---|---|---|
+|1|`config.yaml`|YAML|Experiment configuration|
+|2|`orchestrator.py`|Python|Main experiment automation|
+|3|`influent_generator.py`|Python|Percentile influent matrix generation|
+|4|`profile_generator.py`|Python|Aeration reduction profile grid|
+|5|`metrics.py`|Python|Derived metric computation (damage indices, energy ratios)|
+|6|`ssASM3_DR_datagen.m`|MATLAB|Refactored step-response simulation engine|
+|7|`ssData_writer_reliability.m`|MATLAB|Data writer for per-step outputs (settler, energy, sCOD)|
+|8|`README.md`|Markdown|Setup, dependencies, usage|
+
+### 5.2 Python — Orchestrator (`orchestrator.py`)
+
+**Responsibilities:**
+
+- Load YAML config
+- Call `influent_generator` to produce percentile influent matrices
+- Call `profile_generator` to produce aeration reduction grid
+- Build the full experiment matrix (influent × aeration × step)
+- For each cycle: write inputs to `sim_config.mat` → invoke MATLAB → collect outputs
+- Assemble all outputs into a single dataset
+- Compute derived metrics via `metrics.py`
+- Write final database (CSV or Parquet)
+
+**Key functions:**
+
+```python
+def load_config(config_path: Path) -> dict:
+    """Load and validate YAML configuration."""
+
+def build_experiment_matrix(config: dict) -> list[dict]:
+    """Generate the full list of experiment cycles.
+    
+    Each cycle is a dict:
+    {
+        'percentile': int,
+        'influent_file': Path,
+        'reduction_factor': float,
+        'KLa3': float, 'KLa4': float, 'KLa5': float,
+        'stoptime': int,
+        'cycle_id': str,   # e.g. "P50_RF075"
+    }
+    """
+
+def write_matlab_config(cycle: dict, config: dict) -> None:
+    """Write sim_config.mat with all parameters MATLAB needs for one cycle.
+    
+    Contains: KLa targets, influent vector, StopTime, nominal KLa values,
+    output paths, model name, and the 3-step protocol flag.
+    """
+
+def invoke_matlab(config: dict) -> None:
+    """Start MATLAB engine, cd to working_dir, run ssASM3_DR_datagen.m, quit."""
+
+def collect_cycle_output(cycle: dict, config: dict) -> dict:
+    """Read MATLAB output file(s) for one completed cycle.
+    Returns dict of baseline/curtailment/recovery outputs."""
+
+def assemble_database(all_cycles: list[dict], config: dict) -> pd.DataFrame:
+    """Combine all cycle outputs into a single DataFrame."""
+
+def run_experiment(config: dict) -> None:
+    """Main entry point. Orchestrates the full experiment."""
+```
+
+**Stop-on-failure behavior:** Log error, save progress checkpoint, halt. Do not skip failed cycles — each cycle depends on its own baseline, so partial results are still valid for completed cycles.
+
+### 5.3 MATLAB — Influent Generator (`influent_generator.mat`)
+
+**Responsibilities:**
+
+- Load `ASM3_Input.mat` (the dynamic influent time series)
+- Compute Q percentiles
+- For each Q percentile, extract and average the corresponding influent parameter vectors
+- Format into `CONSTINFLUENT.mat` structure (2-row identical matrix, 21 columns)
+- Save as individual `.mat` files
+
+**No biological interpretation.** This module treats the influent data as a purely numerical matrix. Column semantics come from config; the module doesn't need to know that column 5 is ammonia.
+
+### 5.4 MATLAB — Profile Generator (`profile_generator.mat`)
+
+**Responsibilities:**
+
+- Generate aeration reduction profiles from config
+- Output a list of profile dicts
+- **The Simulink model is being driven by external KLa time series** (`Workspace` data writeent to blocks in diagram).  
+- **Only KLa tanks 3–5 are manipulated** (script generates 3 files).
+
+### 5.5 Python — Saved Metrics (`metrics.py`)
+
+**Responsibilities:**
+
+- Compute damage indices and energy ratios from MATLAB outputs
+- These are arithmetic operations on model output values — no physics
+
+```python
+def compute_damage_indices(
+    baseline: dict,
+    experimental: dict,
+    limits: dict,
+) -> dict:
+    """Compute effluent damage indices.
+    
+    COD_dmg = (COD_exp - COD_nom) / COD_limit
+    NH4_dmg = (NH4_exp - NH4_nom) / NH4_limit
+    
+    Inputs are settler effluent values from MATLAB.
+    Limits come from config (regulatory_limits).
+    """
+
+def compute_energy_reduction(
+    baseline_energy: float,
+    experimental_energy: float,
+) -> float:
+    """Compute fractional energy reduction.
+    
+    E_red = (E_exp - E_nom) / E_nom
+    
+    Negative value = energy saved during curtailment.
+    """
+```
+
+### 5.6 MATLAB — Step-Response Engine (`ssASM3_DR_datagen.m`)
+
+**Responsibilities:**
+
+- Read experiment parameters from `sim_config.mat`
+- Execute the 3-step protocol (baseline → curtailment → recovery) per cycle
+- Survive `benchmarkinit` workspace destruction using the `clear all` + file-reload pattern
+- Write per-step outputs via `ssData_writer_reliability`
+
+**Refactoring from existing code:**
+
+The existing script runs a flat loop of independent steady-state simulations. The refactored version must implement the **3-step protocol** where Steps B and C inherit state from prior steps within a cycle.
+
+**Structural design:**
+
+```matlab
+%% OUTER LOOP: One iteration per experiment cycle
+while true
+    clear all;
+    
+    % Reload state
+    load('sim_config.mat');   % Contains: test_case, influent_vector, nominal_kla,
+                              %           output_file, ss_model, cycle_id, ...
+    load('sim_state.mat');    % Contains: step (1=baseline, 2=curtailment, 3=recovery),
+                              %           cycle_complete flag
+    
+    if cycle_complete
+        break;
+    end
+    
+    %% --- STEP A: BASELINE (step == 1) ---
+    if step == 1
+        benchmarkinit;
+        load('sim_config.mat');
+        load('sim_state.mat');
+        
+        % Set nominal KLa values
+        % Load influent percentile into CONSTINFLUENT
+        % Configure and run benchmarkss
+        % stateset → capture baseline settler output
+        % ssData_writer_reliability(..., 'baseline')
+        % Save workspace state for Step B inheritance
+        
+        step = 2;
+        save('sim_state.mat', 'step', 'cycle_complete');
+    end
+    
+    %% --- STEP B: CURTAILMENT (step == 2) ---
+    if step == 2
+        % Load Step A's converged state (NO benchmarkinit — preserve biology)
+        load('workspace_baseline.mat');
+        load('sim_config.mat');
+        load('sim_state.mat');
+        
+        % Override KLa to reduced values
+        % Configure StopTime for convergence at reduced aeration
+        % Run benchmarkss
+        % stateset → capture curtailment settler output
+        % ssData_writer_reliability(..., 'curtailment')
+        % Save workspace state for Step C inheritance
+        
+        step = 3;
+        save('sim_state.mat', 'step', 'cycle_complete');
+    end
+    
+    %% --- STEP C: RECOVERY (step == 3) ---
+    if step == 3
+        % Load Step B's converged state (NO benchmarkinit — preserve biology)
+        load('workspace_curtailment.mat');
+        load('sim_config.mat');
+        load('sim_state.mat');
+        
+        % Restore nominal KLa values
+        % Same influent, same state
+        % Run benchmarkss
+        % stateset → capture recovery settler output
+        % ssData_writer_reliability(..., 'recovery')
+        
+        cycle_complete = true;
+        save('sim_state.mat', 'step', 'cycle_complete');
+    end
+end
+
+% Cleanup temp .mat files
+```
+
+**Critical design decisions in the MATLAB script:**
+
+1. **`benchmarkinit` is called ONLY in Step A.** Steps B and C load the prior step's converged workspace directly. This is essential — calling `benchmarkinit` between steps would destroy the accumulated biological state and defeat the purpose of the step-response protocol.
+    
+2. **The `clear all` + reload pattern is preserved** at the top of the while loop for robustness, but `benchmarkinit` is gated to Step A only.
+    
+3. **State inheritance:** Step A saves `workspace_baseline.mat` after convergence. Step B loads it, applies reduced KLa, re-runs, then saves `workspace_curtailment.mat`. Step C loads that, restores nominal KLa, re-runs.
+    
+4. **StopTime varies by step:** Baseline uses `base_stoptime`. Curtailment uses the scaled StopTime. Recovery uses `base_stoptime` (returning to nominal should converge quickly from a nearby state).
+    
+5. **Per-step data writing:** `ssData_writer_reliability` receives a step label ('baseline', 'curtailment', 'recovery') and includes it in the output row.
+    
+
+### 5.7 MATLAB — Data Writer (`ssData_writer_reliability.m`)
+
+**Responsibilities:**
+
+- Accept settler output, KLa values, Q, StopTime, step label, cycle_id
+- Compute sCOD using ASM3 COD fractionation coefficients (model-side calculation)
+- Compute aeration energy (model-side calculation)
+- Append one row to the output CSV
+
+**Output columns (proposed):**
+
+```
+if exist('CONSTINFLUENT','var') == 1
+    Q = CONSTINFLUENT(1,15);
+end
+cycle_id, percentile, KLA_reduction_factor,
+KLa3, KLa4, KLa5
+TSS, COD_total, sCOD, BOD, TKN, NH4, NO3, Total_P,
+aeration_energy,
+SNH_eff = settler(end, 25);
+SI_eff  = settler(end, 23);
+SS_eff  = settler(end, 24);
+XI_eff  = settler(end, 29);
+XS_eff  = settler(end, 30);
+XH_eff  = settler(end, 31);
+XSTO_eff= settler(end, 32);
+XA_eff  = settler(end, 33);
+if size(settler,2) < 33
+    error('settler must have at least 33 columns, got %d', size(settler,2));
+end
+COD_eff = SI_eff + SS_eff + XI_eff + XS_eff + XH_eff + XA_eff + XSTO_eff;
+output_data = [iter, KLa3, KLa4, KLa5, Q, sim_stoptime, ...
+               SNH_eff, SI_eff, SS_eff, XI_eff, XS_eff, ...
+               XH_eff, XA_eff, XSTO_eff, COD_eff, failure];
+```
+
+**sCOD and energy are computed here** (MATLAB side) because they depend on ASM3 stoichiometric coefficients and model parameters. Python receives them as pre-computed values.
+
+### 5.8 Interface Contract
+
+```
+Python → MATLAB (per cycle):
+    sim_config.mat          Cycle parameters: KLa targets, influent vector,
+                            nominal KLa, StopTime, output path, cycle_id, model name
+    sim_state.mat           Mutable state: step counter, cycle_complete flag
+
+MATLAB → Python (per cycle):
+    {output_dir}/{dataset_filename}     CSV with 3 appended rows (baseline/curtailment/recovery)
+
+MATLAB internal (workspace state between steps):
+    workspace_baseline.mat              Converged state after Step A
+    workspace_curtailment.mat           Converged state after Step B
+```
+
+### 5.9 Code Quality Requirements
+
+|Requirement|Python|MATLAB|
+|---|---|---|
+|Configuration|YAML config; `sim_config.mat` for MATLAB handoff|Reads `sim_config.mat` exclusively|
+|Logging|Python `logging` module|`fprintf` with `===`/`---`/`✓`/`⚠` markers|
+|Error handling|try/except, save checkpoint, halt|try/catch per step, increment on error to avoid infinite loop|
+|Documentation|Google-style docstrings|Header block, inline comments|
+|Type hints|All public functions|N/A|
+|Path handling|`pathlib.Path`|Paths from `sim_config.mat`|
+|No hardcoded paths|✓|✓ — all paths via config|
+
+---
+
+## 6. QA Agent Prompt — Detailed Specification
+
+### 6.1 Deliverables
+
+|#|File|Purpose|
+|---|---|---|
+|1|`test_influent_generator.py`|Unit tests for percentile computation and .mat export|
+|2|`test_profile_generator.py`|Unit tests for aeration grid and StopTime scaling|
+|3|`test_metrics.py`|Unit tests for damage indices and energy ratios|
+|4|`test_orchestrator.py`|Integration tests for experiment matrix and MATLAB invocation|
+|5|`test_interface_contract.py`|Validation of .mat file structures|
+|6|`validate_matlab_logic.m`|MATLAB-side validation of step sequencing, workspace survival|
+
+### 6.2 Unit Tests — Influent Generator
+
+|Test ID|Description|Assertion|
+|---|---|---|
+|INF-01|Percentile count|5 influent vectors produced (one per percentile)|
+|INF-02|Vector dimensions|Each vector is 2×21 (CONSTINFLUENT format)|
+|INF-03|Row identity|Row 1 equals row 2 in each output matrix|
+|INF-04|Q ordering|Q values increase monotonically across percentiles 10→90|
+|INF-05|Q accuracy|Each Q value is within tolerance of the actual percentile of the source data|
+|INF-06|Column preservation|Dummy columns (17–21) are present and correctly positioned|
+|INF-07|.mat variable name|Output file contains variable `CONSTINFLUENT`|
+|INF-08|Round-trip|Generate → save → reload → values match within float tolerance|
+
+### 6.3 Unit Tests — Profile Generator
+
+|Test ID|Description|Assertion|
+|---|---|---|
+|PRF-01|Profile count|Number of profiles equals `len(reduction_factors)`|
+|PRF-02|Nominal profile|Factor=1.0 yields exact nominal KLa values|
+|PRF-03|Minimum reduction|Factor=0.5 yields 50% of nominal for all tanks|
+|PRF-04|Proportional scaling|`KLa_reduced / KLa_nominal` equals `reduction_factor` for each tank|
+|PRF-05|StopTime at nominal|`reduction_factor=1.0` → `base_stoptime`|
+|PRF-06|StopTime at max reduction|`reduction_factor=0.5` → `max_stoptime`|
+|PRF-07|StopTime monotonicity|StopTime increases as reduction_factor decreases|
+|PRF-08|Floor enforcement|No KLa value falls below 50% of nominal|
+
+### 6.4 Unit Tests — Derived Metrics
+
+|Test ID|Description|Assertion|
+|---|---|---|
+|MET-01|COD damage at nominal|`COD_exp == COD_nom` → `COD_dmg == 0.0`|
+|MET-02|NH4 damage at nominal|`NH4_exp == NH4_nom` → `NH4_dmg == 0.0`|
+|MET-03|Energy reduction at nominal|`E_exp == E_nom` → `E_red == 0.0`|
+|MET-04|Positive damage|`COD_exp > COD_nom` → `COD_dmg > 0`|
+|MET-05|Energy savings|`E_exp < E_nom` → `E_red < 0`|
+|MET-06|Limit weighting|Changing `COD_limit` changes `COD_dmg` proportionally|
+|MET-07|Zero-division guard|`E_nom == 0` raises error or returns sentinel, never crashes|
+
+### 6.5 Integration Tests — Orchestrator
+
+|Test ID|Description|Assertion|
+|---|---|---|
+|ORC-01|Experiment matrix size|`5 percentiles × 11 profiles = 55 cycles`|
+|ORC-02|Cycle IDs unique|All cycle_ids are distinct|
+|ORC-03|sim_config.mat structure|Contains all required fields for MATLAB handoff|
+|ORC-04|MATLAB invocation sequence|`start_matlab → cd → run → quit` (mocked)|
+|ORC-05|Output collection|Reads CSV rows matching cycle_id after MATLAB returns|
+|ORC-06|Database assembly|Final DataFrame has `55 × 3 = 165` rows|
+|ORC-07|Stop-on-failure|Exception halts loop, progress checkpoint saved|
+
+### 6.6 Interface Contract Tests
+
+|Test ID|Description|Assertion|
+|---|---|---|
+|IFC-01|sim_config.mat fields|All required keys present and correctly typed|
+|IFC-02|sim_state.mat fields|`step` is int in {1,2,3}; `cycle_complete` is logical|
+|IFC-03|Output CSV schema|All expected columns present; no NaN in required fields|
+|IFC-04|Step labels|Each cycle has exactly 3 rows: baseline, curtailment, recovery|
+|IFC-05|Cycle grouping|Rows within a cycle share the same `cycle_id` and `percentile`|
+
+### 6.7 MATLAB Validation Script
+
+|Test ID|Description|Assertion|
+|---|---|---|
+|MTL-01|Step sequencing|Steps execute in order 1→2→3 with correct workspace loads|
+|MTL-02|benchmarkinit gating|`benchmarkinit` called only in Step 1, never in Steps 2–3|
+|MTL-03|Workspace survival|After `clear all` + reload, all config fields are intact|
+|MTL-04|State inheritance|Step B loads `workspace_baseline.mat`; Step C loads `workspace_curtailment.mat`|
+|MTL-05|StopTime per step|Baseline and recovery use `base_stoptime`; curtailment uses scaled value|
+|MTL-06|KLa values per step|Baseline and recovery use nominal; curtailment uses reduced|
+
+### 6.8 Testing Framework
+
+- **Python:** `pytest` with `tmp_path`, `scipy.io` for .mat round-trip tests
+- **MATLAB:** Assertion-based script (no Simulink required)
+- **Mocking:** `unittest.mock` for MATLAB engine and filesystem
+- **No Simulink in tests:** All tests validate logic, data structures, and contracts
+
+---
+
+## 7. Prompt Delivery Strategy
+
+### 7.1 Prompt Structure (Both Agents)
+
+1. **Role & Objective**
+2. **Architecture Context** — Layer diagram, responsibility boundary, physics guardrail
+3. **Step-Response Protocol** — The 3-step cycle with state inheritance
+4. **Reference Code** — `ssASM3_DR_datagen.m` (embedded in full as the workspace survival pattern reference)
+5. **Specification** — Per-deliverable requirements from Sections 5/6
+6. **Configuration** — YAML structure
+7. **Interface Contract** — File-based communication protocol
+8. **Black-Box Dependencies** — `benchmarkinit`, `benchmarkss`, `stateset`, `perf_plant_LT_DR` (calling signatures only)
+9. **Constraints & Negative Requirements** — No Python physics, no banned terminology
+10. **Acceptance Criteria** — Verifiable conditions for "done"
+
+### 7.2 Prompt Sequencing
+
+```
+Step 1: Generate Developer Agent prompt → Review → Incorporate feedback
+Step 2: Generate QA Agent prompt (referencing Developer spec) → Review → Incorporate feedback
+```
+
+---
+
+## 8. Decision Log
+
+|Decision|Rationale|
+|---|---|
+|sCOD and energy calculated in MATLAB|These require ASM3 stoichiometric coefficients — model-coupled calculations|
+|Damage indices and energy ratios in Python|Simple arithmetic on MATLAB outputs; no model knowledge needed|
+|`benchmarkinit` gated to Step A only|Steps B/C must inherit biological state from prior steps|
+|Proportional aeration reduction (single factor)|Matches existing code pattern; independent variation is combinatorially expensive|
+|StopTime scaled linearly with reduction|Physical: reduced aeration = slower convergence. Config-driven.|
+|`sim_config.mat` as Python→MATLAB interface|Avoids YAML parsing in MATLAB; Python writes, MATLAB reads|
+|`clear all` + file-reload pattern preserved|Battle-tested workspace survival; the existing code proves it works|
+|5 percentiles × 11 reduction levels = 55 cycles|Defensible coverage without excessive computation|
+|Per-step data writing in MATLAB|Each step appends to CSV immediately; crash recovery loses only current step|
