@@ -1,0 +1,39 @@
+# ==========================================
+# LEYP OPTIMIZER CONFIGURATION
+# ==========================================
+
+# 1. FILE PATHS
+master_input_file: "/Users/aya/github/LEYP_Pipe/Louisa_LEYP_Input_csv.csv"
+output_base_dir: "Optimization_Results_NSGA2"
+
+# 2. DATA PROCESSING
+skip_segmentation: True
+
+# 3. GENE BOUNDS (The "Search Space")
+genes:
+  budget: 
+    min: 5000
+    max: 1000000   # Increased to capture the "High Cost" side of the curve
+  pm_start: 
+    min: 2.0
+    max: 4.0
+  pm_stop: 
+    min: 2.0
+    max: 4.0
+  rehab_trigger: 
+    min: 1.0
+    max: 2.0
+  budget_split:   # <--- NEW GENE
+    min: 0.1      # 10% Capital / 90% PM
+    max: 0.9      # 90% Capital / 10% PM
+
+# 4. ECONOMIC PARAMETERS
+# Global multiplier for Risk = Length * CoF * This_Value
+avg_failure_cost_per_ft: 500.0
+
+# 5. ALGORITHM SETTINGS
+algorithm:
+  pop_size: 50
+  n_offsprings: 15
+  n_gen: 40
+  seed: 1027895609238
