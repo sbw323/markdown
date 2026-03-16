@@ -4,22 +4,28 @@ Python subprocess helpers and in-process MCP tool server for the Claude
 development agent.
 
 AUDIT FIXES APPLIED:
-    F05 — Added validate_simulation_output tool for numerical plausibility
-    F09 — inspect_csv and inspect_yaml pass file paths via sys.argv to
-           prevent path injection from special characters
+    F05 — validate_simulation_output tool for numerical plausibility
+    F09 — inspect_csv/yaml pass file paths via sys.argv (safe path handling)
+
+CHECKPOINT GAPS FILLED:
+    Gap 14 — validate_simulation_output now checks nsga2_checkpoint.pkl
+             is cleaned up after successful run
+    Gap 15 — New inspect_checkpoint tool for verifying pickle integrity
+             and checkpoint.json state during preemption resume testing
 
 TOOLS PROVIDED:
     run_ruff              — Lint with ruff
-    run_ruff_format       — Formatting check with ruff format
+    run_ruff_format       — Formatting check
     run_pytest            — Execute pytest
-    python_syntax_check   — Verify .py compiles (py_compile)
+    python_syntax_check   — Verify .py compiles
     run_mypy              — Static type checking
-    inspect_csv           — CSV schema, shape, sample (safe path handling)
-    inspect_yaml          — YAML structure (safe path handling)
+    inspect_csv           — CSV schema, shape, sample
+    inspect_yaml          — YAML structure
     grep_codebase         — Regex search across .py files
     run_python_script     — Execute arbitrary Python
     check_imports         — Verify module imports cleanly
-    validate_simulation_output — Domain-specific numerical plausibility checks
+    validate_simulation_output — Domain-specific plausibility + checkpoint cleanup
+    inspect_checkpoint    — Verify checkpoint.json state and pickle integrity
 """
 
 from __future__ import annotations
@@ -195,7 +201,7 @@ def build_python_mcp_server():
         result = run_shell_cmd(cmd, timeout=120)
         return _format_result("mypy", result)
 
-    # ── Data inspection (Fix F09: safe path handling) ──────────────────
+    # ── Data inspection (safe path handling via sys.argv) ──────────────
 
     @tool(
         "inspect_csv",
@@ -205,8 +211,6 @@ def build_python_mcp_server():
     async def inspect_csv(args):
         file_path = args["file_path"]
         n = args.get("sample_rows", 5)
-        # Fix F09: pass file_path and sample_rows via sys.argv to avoid
-        # path injection from quotes/spaces in filenames.
         script = (
             "import pandas as pd, sys\n"
             "fp, n = sys.argv[1], int(sys.argv[2])\n"
@@ -232,7 +236,6 @@ def build_python_mcp_server():
     )
     async def inspect_yaml(args):
         file_path = args["file_path"]
-        # Fix F09: pass file_path via sys.argv
         script = (
             "import yaml, json, sys\n"
             "with open(sys.argv[1]) as f:\n"
@@ -249,7 +252,7 @@ def build_python_mcp_server():
         "grep_codebase",
         (
             "Search for a regex pattern across all .py files.  Use for "
-            "dead-code audits (sewer terms) and string constant verification."
+            "dead-code audits and string constant verification."
         ),
         {"pattern": str, "directory": str},
     )
@@ -311,20 +314,19 @@ def build_python_mcp_server():
         result = run_shell_cmd(cmd, timeout=30)
         return _format_result("import check", result)
 
-    # ── Simulation output validation (Fix F05) ─────────────────────────
+    # ── Simulation output validation (F05 + Gap 14) ────────────────────
 
     @tool(
         "validate_simulation_output",
         (
-            "Check that optimizer output files are physically and "
-            "economically plausible.  Reads nsga2_results.csv and "
-            "Optimal_Action_Plan.csv from a directory and validates: "
-            "costs >= 0, no NaN/Inf, Total = Investment + Risk, budgets "
-            "within gene bounds, action types in allowed set, conditions "
-            "in [1,6].  Returns structured PASS/FAIL report."
+            "Check optimizer output files for plausibility AND verify "
+            "checkpoint cleanup.  Reads nsga2_results.csv, "
+            "Optimal_Action_Plan.csv, checks for stale checkpoint pickle. "
+            "Returns structured PASS/FAIL report."
         ),
         {"output_dir": str, "budget_min": float, "budget_max": float,
-         "trigger_min": float, "trigger_max": float},
+         "trigger_min": float, "trigger_max": float,
+         "checkpoint_pkl_path": str},
     )
     async def validate_simulation_output(args):
         output_dir = args.get("output_dir", "Optimization_Results_NSGA2")
@@ -332,15 +334,25 @@ def build_python_mcp_server():
         budget_max = args.get("budget_max", 2000000.0)
         trigger_min = args.get("trigger_min", 1.0)
         trigger_max = args.get("trigger_max", 3.5)
-        # Fix F05: self-contained validation script with domain-specific
-        # plausibility checks.  Encodes the physics/economic invariants
-        # from the VERIFY prompt into an automated, single-call tool.
+        checkpoint_pkl = args.get("checkpoint_pkl_path", "nsga2_checkpoint.pkl")
         script = (
             "import pandas as pd, sys, os, math\n"
             "output_dir = sys.argv[1]\n"
             "budget_min, budget_max = float(sys.argv[2]), float(sys.argv[3])\n"
             "trigger_min, trigger_max = float(sys.argv[4]), float(sys.argv[5])\n"
+            "checkpoint_pkl = sys.argv[6]\n"
             "fails = []\n"
+            "\n"
+            "# --- Checkpoint cleanup check (Gap 14) ---\n"
+            "if os.path.exists(checkpoint_pkl):\n"
+            "    fails.append(\n"
+            "        f'FAIL: {checkpoint_pkl} still exists after optimization. '\n"
+            "        'opt_ckpt.cleanup() was not called or was called before '\n"
+            "        'output files were written. A stale pickle causes the next '\n"
+            "        'run to resume from old state instead of starting fresh.'\n"
+            "    )\n"
+            "else:\n"
+            "    print(f'Checkpoint cleanup: {checkpoint_pkl} correctly removed.')\n"
             "\n"
             "# --- Pareto front checks ---\n"
             "pareto_path = os.path.join(output_dir, 'nsga2_results.csv')\n"
@@ -364,7 +376,7 @@ def build_python_mcp_server():
             "                fails.append('FAIL: Total != Investment + Risk (tolerance 1.0)')\n"
             "        if 'Budget' in df.columns:\n"
             "            if (df['Budget'] < budget_min * 0.9).any() or (df['Budget'] > budget_max * 1.1).any():\n"
-            "                fails.append(f'WARN: Budget values outside [{budget_min}, {budget_max}] bounds')\n"
+            "                fails.append(f'WARN: Budget outside [{budget_min}, {budget_max}]')\n"
             "        if 'Rehab_Trigger' in df.columns:\n"
             "            if (df['Rehab_Trigger'] < trigger_min * 0.9).any() or (df['Rehab_Trigger'] > trigger_max * 1.1).any():\n"
             "                fails.append(f'WARN: Rehab_Trigger outside [{trigger_min}, {trigger_max}]')\n"
@@ -407,7 +419,7 @@ def build_python_mcp_server():
             "    if not os.path.exists(fpath):\n"
             "        fails.append(f'FAIL: {fname} not found')\n"
             "    elif os.path.getsize(fpath) < 1000:\n"
-            "        fails.append(f'WARN: {fname} is suspiciously small ({os.path.getsize(fpath)} bytes)')\n"
+            "        fails.append(f'WARN: {fname} suspiciously small ({os.path.getsize(fpath)} bytes)')\n"
             "\n"
             "# --- Verdict ---\n"
             "if fails:\n"
@@ -426,9 +438,90 @@ def build_python_mcp_server():
             output_dir,
             str(budget_min), str(budget_max),
             str(trigger_min), str(trigger_max),
+            checkpoint_pkl,
         ]
         result = run_shell_cmd(cmd, timeout=60)
         return _format_result("validate_simulation_output", result)
+
+    # ── Checkpoint inspection (Gap 15) ─────────────────────────────────
+
+    @tool(
+        "inspect_checkpoint",
+        (
+            "Inspect checkpoint state files for the preemption resume test "
+            "in S08.  Can inspect two file types:\n"
+            "  mode='json' — reads checkpoint.json and reports sprint/phase "
+            "completion status, preemption count, elapsed time.\n"
+            "  mode='pickle' — loads nsga2_checkpoint.pkl and reports the "
+            "algorithm generation number, population size, and whether the "
+            "pickle is loadable without corruption.\n"
+            "Use during S08 INTEGRATE phase to verify preemption resume."
+        ),
+        {"file_path": str, "mode": str},
+    )
+    async def inspect_checkpoint(args):
+        file_path = args["file_path"]
+        mode = args.get("mode", "auto")
+        script = (
+            "import sys, os, json\n"
+            "fp = sys.argv[1]\n"
+            "mode = sys.argv[2]\n"
+            "\n"
+            "if not os.path.exists(fp):\n"
+            "    print(f'FILE NOT FOUND: {fp}')\n"
+            "    sys.exit(1)\n"
+            "\n"
+            "fsize = os.path.getsize(fp)\n"
+            "print(f'File: {fp} ({fsize:,} bytes)')\n"
+            "\n"
+            "# Auto-detect mode from extension\n"
+            "if mode == 'auto':\n"
+            "    mode = 'pickle' if fp.endswith('.pkl') else 'json'\n"
+            "\n"
+            "if mode == 'json':\n"
+            "    with open(fp) as f:\n"
+            "        data = json.load(f)\n"
+            "    print(f'Project: {data.get(\"project\", \"unknown\")}')\n"
+            "    print(f'Preemption count: {data.get(\"preemption_count\", 0)}')\n"
+            "    print(f'Total elapsed: {data.get(\"total_elapsed_seconds\", 0):.0f}s')\n"
+            "    print(f'Last checkpoint: {data.get(\"last_checkpoint\", \"never\")}')\n"
+            "    sprints = data.get('sprints', {})\n"
+            "    print(f'Sprints tracked: {len(sprints)}')\n"
+            "    for sid, sdata in sorted(sprints.items()):\n"
+            "        status = sdata.get('status', 'unknown')\n"
+            "        phases = sdata.get('phases', {})\n"
+            "        completed = sum(1 for p in phases.values() if p.get('status') in ('completed', 'skipped'))\n"
+            "        total = len(phases)\n"
+            "        print(f'  {sid}: {status} ({completed}/{total} phases done)')\n"
+            "    checksums = data.get('file_checksums', {})\n"
+            "    print(f'File checksums: {len(checksums)} files tracked')\n"
+            "\n"
+            "elif mode == 'pickle':\n"
+            "    import pickle\n"
+            "    try:\n"
+            "        with open(fp, 'rb') as f:\n"
+            "            algo = pickle.load(f)\n"
+            "        n_gen = getattr(algo, 'n_gen', None)\n"
+            "        pop_size = None\n"
+            "        if hasattr(algo, 'pop') and algo.pop is not None:\n"
+            "            pop_size = len(algo.pop)\n"
+            "        print(f'PICKLE OK: loaded successfully')\n"
+            "        print(f'  Algorithm type: {type(algo).__name__}')\n"
+            "        print(f'  Generation (n_gen): {n_gen}')\n"
+            "        print(f'  Population size: {pop_size}')\n"
+            "        if hasattr(algo, 'opt') and algo.opt is not None:\n"
+            "            print(f'  Current best solutions: {len(algo.opt)}')\n"
+            "        print(f'  Resumable: {\"YES\" if n_gen and n_gen > 0 else \"NO (fresh)\"}')\n"
+            "    except (pickle.UnpicklingError, EOFError, AttributeError, ModuleNotFoundError) as e:\n"
+            "        print(f'PICKLE CORRUPT: {type(e).__name__}: {e}')\n"
+            "        sys.exit(1)\n"
+            "else:\n"
+            "    print(f'Unknown mode: {mode}. Use json or pickle.')\n"
+            "    sys.exit(1)\n"
+        )
+        cmd = ["python", "-c", script, file_path, mode]
+        result = run_shell_cmd(cmd, timeout=30)
+        return _format_result("inspect_checkpoint", result)
 
     # ── Helper ─────────────────────────────────────────────────────────
 
@@ -462,6 +555,7 @@ def build_python_mcp_server():
             run_python_script,
             check_imports,
             validate_simulation_output,
+            inspect_checkpoint,
         ],
     )
     return server
