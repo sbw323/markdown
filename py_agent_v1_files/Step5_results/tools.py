@@ -26,10 +26,6 @@ TOOLS PROVIDED:
     check_imports         — Verify module imports cleanly
     validate_simulation_output — Domain-specific plausibility + checkpoint cleanup
     inspect_checkpoint    — Verify checkpoint.json state and pickle integrity
-
-OPTIONAL DEPENDENCIES:
-    claude_agent_sdk — Only required for build_python_mcp_server().
-                       All other functions work without it.
 """
 
 from __future__ import annotations
@@ -211,15 +207,12 @@ def validate_simulation_output(
         "        if missing:\n"
         "            fails.append(f'FAIL: Action plan missing columns: {missing}')\n"
         "        if 'Action' in ap.columns:\n"
-        "            # Allowed action types — must match leyp_config.py constants:\n"
-        "            #   ACTION_CIP_REPLACEMENT = 'CIP_Replacement'\n"
-        "            #   ACTION_EMERGENCY_REPLACEMENT = 'Emergency_Replacement'\n"
         "            allowed = {'CIP_Replacement', 'Emergency_Replacement'}\n"
         "            bad = set(ap['Action'].unique()) - allowed\n"
         "            if bad:\n"
         "                fails.append(f'FAIL: Unknown action types: {bad}')\n"
-        "            cip_n = (ap['Action'] == 'CIP_Replacement').sum()   # leyp_config.ACTION_CIP_REPLACEMENT\n"
-        "            emg_n = (ap['Action'] == 'Emergency_Replacement').sum()   # leyp_config.ACTION_EMERGENCY_REPLACEMENT\n"
+        "            cip_n = (ap['Action'] == 'CIP_Replacement').sum()\n"
+        "            emg_n = (ap['Action'] == 'Emergency_Replacement').sum()\n"
         "            print(f'Action plan: {len(ap)} entries (CIP: {cip_n}, Emergency: {emg_n})')\n"
         "        if 'Cost' in ap.columns and (ap['Cost'] < 0).any():\n"
         "            fails.append('FAIL: Negative costs in action plan')\n"
@@ -334,18 +327,8 @@ def inspect_checkpoint(
 # ---------------------------------------------------------------------------
 
 def build_python_mcp_server():
-    """Create an in-process MCP server with Python development tools.
-
-    Requires the optional ``claude_agent_sdk`` package.  If not installed,
-    raises ``ImportError`` with installation instructions.
-    """
-    try:
-        from claude_agent_sdk import tool, create_sdk_mcp_server
-    except ModuleNotFoundError:
-        raise ImportError(
-            "claude_agent_sdk is required for the MCP server but is not "
-            "installed.  Install it with:  pip install claude-agent-sdk"
-        ) from None
+    """Create an in-process MCP server with Python development tools."""
+    from claude_agent_sdk import tool, create_sdk_mcp_server
 
     # ── Static analysis ────────────────────────────────────────────────
 

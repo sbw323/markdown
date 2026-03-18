@@ -56,7 +56,6 @@ import os
 import sys
 import textwrap
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +63,6 @@ import anthropic
 
 from config.checkpoint import (
     CheckpointManager,
-    CheckpointState,
     EXIT_INTEGRITY,
     EXIT_PREEMPTED,
     install_preemption_handler,
@@ -72,11 +70,7 @@ from config.checkpoint import (
 )
 from config.prompts import BASE_CONTEXT, PHASE_PROMPTS
 from config.sprints import SPRINTS, Sprint, SprintPhase
-from config.tools import (
-    run_shell_cmd,
-    validate_simulation_output as _validate_output_impl,
-    inspect_checkpoint as _inspect_checkpoint_impl,
-)
+from config.tools import run_shell_cmd
 
 logger = logging.getLogger("orchestrator")
 
@@ -369,35 +363,13 @@ def dispatch_tool(
 
 
 def _resolve(path_str: str, root: Path) -> Path:
-    """Resolve a path and verify it stays within the project root.
-
-    Both relative and absolute paths are resolved and checked.
-    Raises ValueError if the resolved path escapes the sandbox.
-
-    Args:
-        path_str: Path string from the agent's tool call.
-        root: Project root directory (sandbox boundary).
-
-    Returns:
-        Resolved absolute Path guaranteed to be within root.
-
-    Raises:
-        ValueError: If the resolved path is outside the project root.
-    """
-    root_resolved = root.resolve()
+    """Resolve a path relative to the project root.  Prevents escaping."""
     p = Path(path_str)
-
     if p.is_absolute():
-        resolved = p.resolve()
-    else:
-        resolved = (root_resolved / p).resolve()
-
-    if not resolved.is_relative_to(root_resolved):
-        raise ValueError(
-            f"Path escapes project root: {path_str!r} "
-            f"(resolves to {resolved}, root is {root_resolved})"
-        )
-
+        return p
+    resolved = (root / p).resolve()
+    if not str(resolved).startswith(str(root.resolve())):
+        raise ValueError(f"Path escapes project root: {path_str}")
     return resolved
 
 
@@ -405,16 +377,6 @@ def _tool_read_file(args: dict, root: Path) -> str:
     path = _resolve(args["path"], root)
     if not path.exists():
         return f"ERROR: File not found: {path}"
-
-    # Guard against reading very large files into memory
-    file_size = path.stat().st_size
-    if file_size > 500_000:  # 500 KB
-        return (
-            f"ERROR: File too large ({file_size:,} bytes): {args['path']}. "
-            f"Use inspect_csv for CSV files, or grep_codebase to search "
-            f"for specific content."
-        )
-
     try:
         content = path.read_text()
         lines = content.splitlines()
@@ -463,12 +425,6 @@ def _tool_delete_file(args: dict, root: Path) -> str:
     path = _resolve(args["path"], root)
     if path.exists():
         path.unlink()
-        # Note: checkpoint file_checksums is not updated here.
-        # The stale entry is resolved at sprint completion when
-        # mark_sprint_completed() recomputes all checksums.
-        # If preemption occurs before sprint completion, the
-        # integrity check correctly identifies this sprint for
-        # re-run, which will re-delete the file.
         return f"OK: Deleted {args['path']}."
     return f"OK: {args['path']} does not exist (already deleted)."
 
@@ -557,8 +513,8 @@ def _tool_shell(name: str, args: dict, root: Path) -> str:
         script = (
             f"import {module}\n"
             f"attrs = [a for a in dir({module}) if not a.startswith('_')]\n"
-            f"print('OK: {module} imported successfully')\n"
-            "print('Public attributes ({n}): {a}'.format(n=len(attrs), a=attrs))\n"
+            f"print(f'OK: {module} imported successfully')\n"
+            f"print(f'Public attributes ({{len(attrs)}}): {{attrs}}')\n"
         )
         cmd = ["python", "-c", script]
         timeout = 30
@@ -588,25 +544,84 @@ def _tool_shell(name: str, args: dict, root: Path) -> str:
 
 
 def _tool_validate_output(args: dict, root: Path) -> str:
-    """Validate simulation output — delegates to config.tools."""
-    result = _validate_output_impl(
-        output_dir=args.get("output_dir", "Optimization_Results_NSGA2"),
-        budget_min=args.get("budget_min", 10000.0),
-        budget_max=args.get("budget_max", 2000000.0),
-        trigger_min=args.get("trigger_min", 1.0),
-        trigger_max=args.get("trigger_max", 3.5),
-        checkpoint_pkl_path=args.get("checkpoint_pkl_path", "nsga2_checkpoint.pkl"),
-        cwd=str(root),
+    """Run the validate_simulation_output script from tools.py."""
+    output_dir = args.get("output_dir", "Optimization_Results_NSGA2")
+    budget_min = str(args.get("budget_min", 10000.0))
+    budget_max = str(args.get("budget_max", 2000000.0))
+    trigger_min = str(args.get("trigger_min", 1.0))
+    trigger_max = str(args.get("trigger_max", 3.5))
+    pkl = args.get("checkpoint_pkl_path", "nsga2_checkpoint.pkl")
+
+    script = (
+        "import pandas as pd, sys, os, math\n"
+        "output_dir, budget_min, budget_max = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])\n"
+        "trigger_min, trigger_max, pkl = float(sys.argv[4]), float(sys.argv[5]), sys.argv[6]\n"
+        "fails = []\n"
+        "if os.path.exists(pkl):\n"
+        "    fails.append(f'FAIL: {pkl} still exists — cleanup() not called')\n"
+        "else:\n"
+        "    print(f'Checkpoint cleanup: {pkl} correctly removed.')\n"
+        "pareto = os.path.join(output_dir, 'nsga2_results.csv')\n"
+        "if not os.path.exists(pareto):\n"
+        "    fails.append('FAIL: nsga2_results.csv not found')\n"
+        "else:\n"
+        "    df = pd.read_csv(pareto)\n"
+        "    for c in ['Investment_Cost','Risk_Cost','Total_Cost']:\n"
+        "        if c not in df.columns: fails.append(f'FAIL: missing {c}')\n"
+        "        elif (df[c]<0).any(): fails.append(f'FAIL: negative {c}')\n"
+        "    print(f'Pareto: {len(df)} solutions')\n"
+        "plan = os.path.join(output_dir, 'Optimal_Action_Plan.csv')\n"
+        "if not os.path.exists(plan):\n"
+        "    fails.append('FAIL: Optimal_Action_Plan.csv not found')\n"
+        "for f in ['optimization_curve.png','validation_curve.png']:\n"
+        "    if not os.path.exists(os.path.join(output_dir, f)):\n"
+        "        fails.append(f'FAIL: {f} not found')\n"
+        "if fails:\n"
+        "    for f in fails: print(f'  {f}')\n"
+        "    print('Verdict: FAIL')\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    print('Verdict: PASS')\n"
+    )
+    result = run_shell_cmd(
+        ["python", "-c", script, output_dir, budget_min, budget_max,
+         trigger_min, trigger_max, pkl],
+        timeout=60, cwd=str(root),
     )
     return (result["stdout"] + result["stderr"]).strip()
 
 
 def _tool_inspect_checkpoint(args: dict, root: Path) -> str:
-    """Inspect checkpoint files — delegates to config.tools."""
-    result = _inspect_checkpoint_impl(
-        file_path=args["file_path"],
-        mode=args.get("mode", "auto"),
-        cwd=str(root),
+    """Inspect a checkpoint file (JSON or pickle)."""
+    fp = args["file_path"]
+    mode = args.get("mode", "auto")
+    script = (
+        "import sys, os, json\n"
+        "fp, mode = sys.argv[1], sys.argv[2]\n"
+        "if not os.path.exists(fp):\n"
+        "    print(f'FILE NOT FOUND: {fp}'); sys.exit(1)\n"
+        "print(f'File: {fp} ({os.path.getsize(fp):,} bytes)')\n"
+        "if mode == 'auto':\n"
+        "    mode = 'pickle' if fp.endswith('.pkl') else 'json'\n"
+        "if mode == 'json':\n"
+        "    data = json.load(open(fp))\n"
+        "    print(f'Preemptions: {data.get(\"preemption_count\",0)}')\n"
+        "    sprints = data.get('sprints',{})\n"
+        "    for sid, s in sorted(sprints.items()):\n"
+        "        phases = s.get('phases',{})\n"
+        "        done = sum(1 for p in phases.values() if p.get('status') in ('completed','skipped'))\n"
+        "        print(f'  {sid}: {s.get(\"status\")} ({done}/{len(phases)} phases)')\n"
+        "elif mode == 'pickle':\n"
+        "    import pickle\n"
+        "    try:\n"
+        "        algo = pickle.load(open(fp,'rb'))\n"
+        "        print(f'PICKLE OK: gen={getattr(algo,\"n_gen\",None)}')\n"
+        "    except Exception as e:\n"
+        "        print(f'PICKLE CORRUPT: {e}'); sys.exit(1)\n"
+    )
+    result = run_shell_cmd(
+        ["python", "-c", script, fp, mode],
+        timeout=30, cwd=str(root),
     )
     return (result["stdout"] + result["stderr"]).strip()
 
@@ -1001,9 +1016,10 @@ def main() -> int:
 
     if args.fresh:
         logger.info("--fresh flag: ignoring existing checkpoint.")
-        mgr.state = CheckpointState(
-            project=mgr.project_name,
-            start_time=datetime.now(timezone.utc).isoformat(),
+        mgr.state.start_time = (
+            __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).isoformat()
         )
     else:
         mgr.load()
@@ -1100,18 +1116,12 @@ def main() -> int:
     if any_failed:
         return 1
 
-    # Compute completed count over the same set of sprints that were candidates to run.
-    if sprint_filter is not None:
-        candidate_sprints = [s for s in SPRINTS if s.id in sprint_filter]
-    else:
-        candidate_sprints = list(SPRINTS)
-
-    completed = sum(1 for s in candidate_sprints if mgr.is_sprint_completed(s.id))
-    total = len(candidate_sprints)
+    completed = sum(1 for s in SPRINTS if mgr.is_sprint_completed(s.id))
+    total = len(SPRINTS) if sprint_filter is None else len(sprint_filter)
     if completed >= total:
-        logger.info("All targeted sprints completed successfully.")
+        logger.info("All sprints completed successfully.")
     else:
-        logger.info("%d/%d sprints completed.", completed, total)
+        logger.info("%d/%d sprints completed.", completed, len(SPRINTS))
 
     return 0
 

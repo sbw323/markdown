@@ -151,12 +151,6 @@ When optimization completes, the following are written to `Optimization_Results_
 pip install numpy pandas matplotlib pyyaml pymoo
 ```
 
-**Optional** (only required for the MCP server path):
-
-```
-pip install claude-agent-sdk
-```
-
 ### Single Simulation
 
 ```python

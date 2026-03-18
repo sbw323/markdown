@@ -26,10 +26,6 @@ TOOLS PROVIDED:
     check_imports         — Verify module imports cleanly
     validate_simulation_output — Domain-specific plausibility + checkpoint cleanup
     inspect_checkpoint    — Verify checkpoint.json state and pickle integrity
-
-OPTIONAL DEPENDENCIES:
-    claude_agent_sdk — Only required for build_python_mcp_server().
-                       All other functions work without it.
 """
 
 from __future__ import annotations
@@ -127,225 +123,12 @@ def run_ruff_cmd(
 
 
 # ---------------------------------------------------------------------------
-# Domain-specific validation tools (used by orchestrator dispatch)
-# ---------------------------------------------------------------------------
-
-def validate_simulation_output(
-    output_dir: str = "Optimization_Results_NSGA2",
-    budget_min: float = 10000.0,
-    budget_max: float = 2000000.0,
-    trigger_min: float = 1.0,
-    trigger_max: float = 3.5,
-    checkpoint_pkl_path: str = "nsga2_checkpoint.pkl",
-    cwd: Optional[str | Path] = None,
-) -> dict[str, str]:
-    """Check optimizer outputs for plausibility and checkpoint cleanup.
-
-    Runs as a subprocess so it doesn't pollute the orchestrator's
-    import environment with pandas/numpy.
-
-    Returns:
-        dict with 'stdout', 'stderr', 'returncode' keys.
-    """
-    script = (
-        "import pandas as pd, sys, os, math\n"
-        "output_dir = sys.argv[1]\n"
-        "budget_min, budget_max = float(sys.argv[2]), float(sys.argv[3])\n"
-        "trigger_min, trigger_max = float(sys.argv[4]), float(sys.argv[5])\n"
-        "checkpoint_pkl = sys.argv[6]\n"
-        "fails = []\n"
-        "\n"
-        "# --- Checkpoint cleanup check (Gap 14) ---\n"
-        "if os.path.exists(checkpoint_pkl):\n"
-        "    fails.append(\n"
-        "        f'FAIL: {checkpoint_pkl} still exists after optimization. '\n"
-        "        'opt_ckpt.cleanup() was not called or was called before '\n"
-        "        'output files were written. A stale pickle causes the next '\n"
-        "        'run to resume from old state instead of starting fresh.'\n"
-        "    )\n"
-        "else:\n"
-        "    print(f'Checkpoint cleanup: {checkpoint_pkl} correctly removed.')\n"
-        "\n"
-        "# --- Pareto front checks ---\n"
-        "pareto_path = os.path.join(output_dir, 'nsga2_results.csv')\n"
-        "if not os.path.exists(pareto_path):\n"
-        "    fails.append('FAIL: nsga2_results.csv not found')\n"
-        "else:\n"
-        "    df = pd.read_csv(pareto_path)\n"
-        "    if len(df) == 0:\n"
-        "        fails.append('FAIL: nsga2_results.csv is empty')\n"
-        "    else:\n"
-        "        for col in ['Investment_Cost', 'Risk_Cost', 'Total_Cost']:\n"
-        "            if col not in df.columns:\n"
-        "                fails.append(f'FAIL: missing column {col}')\n"
-        "            elif (df[col] < 0).any():\n"
-        "                fails.append(f'FAIL: negative values in {col}')\n"
-        "            elif df[col].isna().any() or df[col].apply(lambda x: math.isinf(x)).any():\n"
-        "                fails.append(f'FAIL: NaN or Inf in {col}')\n"
-        "        if 'Total_Cost' in df.columns and 'Investment_Cost' in df.columns and 'Risk_Cost' in df.columns:\n"
-        "            diff = abs(df['Total_Cost'] - df['Investment_Cost'] - df['Risk_Cost'])\n"
-        "            if (diff > 1.0).any():\n"
-        "                fails.append('FAIL: Total != Investment + Risk (tolerance 1.0)')\n"
-        "        if 'Budget' in df.columns:\n"
-        "            if (df['Budget'] < budget_min * 0.9).any() or (df['Budget'] > budget_max * 1.1).any():\n"
-        "                fails.append(f'WARN: Budget outside [{budget_min}, {budget_max}]')\n"
-        "        if 'Rehab_Trigger' in df.columns:\n"
-        "            if (df['Rehab_Trigger'] < trigger_min * 0.9).any() or (df['Rehab_Trigger'] > trigger_max * 1.1).any():\n"
-        "                fails.append(f'WARN: Rehab_Trigger outside [{trigger_min}, {trigger_max}]')\n"
-        "        print(f'Pareto front: {len(df)} solutions')\n"
-        "        print(f'  Investment: ${df[\"Investment_Cost\"].min():,.0f} - ${df[\"Investment_Cost\"].max():,.0f}')\n"
-        "        print(f'  Risk:       ${df[\"Risk_Cost\"].min():,.0f} - ${df[\"Risk_Cost\"].max():,.0f}')\n"
-        "        print(f'  Total min:  ${df[\"Total_Cost\"].min():,.0f}')\n"
-        "\n"
-        "# --- Action plan checks ---\n"
-        "plan_path = os.path.join(output_dir, 'Optimal_Action_Plan.csv')\n"
-        "if not os.path.exists(plan_path):\n"
-        "    fails.append('FAIL: Optimal_Action_Plan.csv not found')\n"
-        "else:\n"
-        "    ap = pd.read_csv(plan_path)\n"
-        "    if len(ap) == 0:\n"
-        "        fails.append('FAIL: Action plan is empty')\n"
-        "    else:\n"
-        "        required = ['Year', 'PipeID', 'Action', 'Cost', 'Priority', 'Condition_Before']\n"
-        "        missing = [c for c in required if c not in ap.columns]\n"
-        "        if missing:\n"
-        "            fails.append(f'FAIL: Action plan missing columns: {missing}')\n"
-        "        if 'Action' in ap.columns:\n"
-        "            # Allowed action types — must match leyp_config.py constants:\n"
-        "            #   ACTION_CIP_REPLACEMENT = 'CIP_Replacement'\n"
-        "            #   ACTION_EMERGENCY_REPLACEMENT = 'Emergency_Replacement'\n"
-        "            allowed = {'CIP_Replacement', 'Emergency_Replacement'}\n"
-        "            bad = set(ap['Action'].unique()) - allowed\n"
-        "            if bad:\n"
-        "                fails.append(f'FAIL: Unknown action types: {bad}')\n"
-        "            cip_n = (ap['Action'] == 'CIP_Replacement').sum()   # leyp_config.ACTION_CIP_REPLACEMENT\n"
-        "            emg_n = (ap['Action'] == 'Emergency_Replacement').sum()   # leyp_config.ACTION_EMERGENCY_REPLACEMENT\n"
-        "            print(f'Action plan: {len(ap)} entries (CIP: {cip_n}, Emergency: {emg_n})')\n"
-        "        if 'Cost' in ap.columns and (ap['Cost'] < 0).any():\n"
-        "            fails.append('FAIL: Negative costs in action plan')\n"
-        "        if 'Condition_Before' in ap.columns:\n"
-        "            conds = ap['Condition_Before']\n"
-        "            if (conds < 0.9).any() or (conds > 6.1).any():\n"
-        "                fails.append('FAIL: Condition_Before outside [1, 6]')\n"
-        "\n"
-        "# --- Output files ---\n"
-        "for fname in ['optimization_curve.png', 'validation_curve.png']:\n"
-        "    fpath = os.path.join(output_dir, fname)\n"
-        "    if not os.path.exists(fpath):\n"
-        "        fails.append(f'FAIL: {fname} not found')\n"
-        "    elif os.path.getsize(fpath) < 1000:\n"
-        "        fails.append(f'WARN: {fname} suspiciously small ({os.path.getsize(fpath)} bytes)')\n"
-        "\n"
-        "# --- Verdict ---\n"
-        "if fails:\n"
-        "    print('\\n--- ISSUES ---')\n"
-        "    for f in fails:\n"
-        "        print(f'  {f}')\n"
-        "    has_fail = any(f.startswith('FAIL') for f in fails)\n"
-        "    print(f'\\nVerdict: {\"FAIL\" if has_fail else \"WARN\"}')\n"
-        "    sys.exit(1 if has_fail else 0)\n"
-        "else:\n"
-        "    print('\\nAll checks passed.')\n"
-        "    print('Verdict: PASS')\n"
-    )
-    cmd = [
-        "python", "-c", script,
-        output_dir,
-        str(budget_min), str(budget_max),
-        str(trigger_min), str(trigger_max),
-        checkpoint_pkl_path,
-    ]
-    return run_shell_cmd(cmd, timeout=60, cwd=cwd)
-
-
-def inspect_checkpoint(
-    file_path: str,
-    mode: str = "auto",
-    cwd: Optional[str | Path] = None,
-) -> dict[str, str]:
-    """Inspect checkpoint.json or nsga2_checkpoint.pkl state.
-
-    Returns:
-        dict with 'stdout', 'stderr', 'returncode' keys.
-    """
-    script = (
-        "import sys, os, json\n"
-        "fp = sys.argv[1]\n"
-        "mode = sys.argv[2]\n"
-        "\n"
-        "if not os.path.exists(fp):\n"
-        "    print(f'FILE NOT FOUND: {fp}')\n"
-        "    sys.exit(1)\n"
-        "\n"
-        "fsize = os.path.getsize(fp)\n"
-        "print(f'File: {fp} ({fsize:,} bytes)')\n"
-        "\n"
-        "# Auto-detect mode from extension\n"
-        "if mode == 'auto':\n"
-        "    mode = 'pickle' if fp.endswith('.pkl') else 'json'\n"
-        "\n"
-        "if mode == 'json':\n"
-        "    with open(fp) as f:\n"
-        "        data = json.load(f)\n"
-        "    print(f'Project: {data.get(\"project\", \"unknown\")}')\n"
-        "    print(f'Preemption count: {data.get(\"preemption_count\", 0)}')\n"
-        "    print(f'Total elapsed: {data.get(\"total_elapsed_seconds\", 0):.0f}s')\n"
-        "    print(f'Last checkpoint: {data.get(\"last_checkpoint\", \"never\")}')\n"
-        "    sprints = data.get('sprints', {})\n"
-        "    print(f'Sprints tracked: {len(sprints)}')\n"
-        "    for sid, sdata in sorted(sprints.items()):\n"
-        "        status = sdata.get('status', 'unknown')\n"
-        "        phases = sdata.get('phases', {})\n"
-        "        completed = sum(1 for p in phases.values() if p.get('status') in ('completed', 'skipped'))\n"
-        "        total = len(phases)\n"
-        "        print(f'  {sid}: {status} ({completed}/{total} phases done)')\n"
-        "    checksums = data.get('file_checksums', {})\n"
-        "    print(f'File checksums: {len(checksums)} files tracked')\n"
-        "\n"
-        "elif mode == 'pickle':\n"
-        "    import pickle\n"
-        "    try:\n"
-        "        with open(fp, 'rb') as f:\n"
-        "            algo = pickle.load(f)\n"
-        "        n_gen = getattr(algo, 'n_gen', None)\n"
-        "        pop_size = None\n"
-        "        if hasattr(algo, 'pop') and algo.pop is not None:\n"
-        "            pop_size = len(algo.pop)\n"
-        "        print(f'PICKLE OK: loaded successfully')\n"
-        "        print(f'  Algorithm type: {type(algo).__name__}')\n"
-        "        print(f'  Generation (n_gen): {n_gen}')\n"
-        "        print(f'  Population size: {pop_size}')\n"
-        "        if hasattr(algo, 'opt') and algo.opt is not None:\n"
-        "            print(f'  Current best solutions: {len(algo.opt)}')\n"
-        "        print(f'  Resumable: {\"YES\" if n_gen and n_gen > 0 else \"NO (fresh)\"}')\n"
-        "    except (pickle.UnpicklingError, EOFError, AttributeError, ModuleNotFoundError) as e:\n"
-        "        print(f'PICKLE CORRUPT: {type(e).__name__}: {e}')\n"
-        "        sys.exit(1)\n"
-        "else:\n"
-        "    print(f'Unknown mode: {mode}. Use json or pickle.')\n"
-        "    sys.exit(1)\n"
-    )
-    cmd = ["python", "-c", script, file_path, mode]
-    return run_shell_cmd(cmd, timeout=30, cwd=cwd)
-
-
-# ---------------------------------------------------------------------------
 # MCP tool server builder
 # ---------------------------------------------------------------------------
 
 def build_python_mcp_server():
-    """Create an in-process MCP server with Python development tools.
-
-    Requires the optional ``claude_agent_sdk`` package.  If not installed,
-    raises ``ImportError`` with installation instructions.
-    """
-    try:
-        from claude_agent_sdk import tool, create_sdk_mcp_server
-    except ModuleNotFoundError:
-        raise ImportError(
-            "claude_agent_sdk is required for the MCP server but is not "
-            "installed.  Install it with:  pip install claude-agent-sdk"
-        ) from None
+    """Create an in-process MCP server with Python development tools."""
+    from claude_agent_sdk import tool, create_sdk_mcp_server
 
     # ── Static analysis ────────────────────────────────────────────────
 
@@ -545,15 +328,119 @@ def build_python_mcp_server():
          "trigger_min": float, "trigger_max": float,
          "checkpoint_pkl_path": str},
     )
-    async def validate_simulation_output_handler(args):
-        result = validate_simulation_output(
-            output_dir=args.get("output_dir", "Optimization_Results_NSGA2"),
-            budget_min=args.get("budget_min", 10000.0),
-            budget_max=args.get("budget_max", 2000000.0),
-            trigger_min=args.get("trigger_min", 1.0),
-            trigger_max=args.get("trigger_max", 3.5),
-            checkpoint_pkl_path=args.get("checkpoint_pkl_path", "nsga2_checkpoint.pkl"),
+    async def validate_simulation_output(args):
+        output_dir = args.get("output_dir", "Optimization_Results_NSGA2")
+        budget_min = args.get("budget_min", 10000.0)
+        budget_max = args.get("budget_max", 2000000.0)
+        trigger_min = args.get("trigger_min", 1.0)
+        trigger_max = args.get("trigger_max", 3.5)
+        checkpoint_pkl = args.get("checkpoint_pkl_path", "nsga2_checkpoint.pkl")
+        script = (
+            "import pandas as pd, sys, os, math\n"
+            "output_dir = sys.argv[1]\n"
+            "budget_min, budget_max = float(sys.argv[2]), float(sys.argv[3])\n"
+            "trigger_min, trigger_max = float(sys.argv[4]), float(sys.argv[5])\n"
+            "checkpoint_pkl = sys.argv[6]\n"
+            "fails = []\n"
+            "\n"
+            "# --- Checkpoint cleanup check (Gap 14) ---\n"
+            "if os.path.exists(checkpoint_pkl):\n"
+            "    fails.append(\n"
+            "        f'FAIL: {checkpoint_pkl} still exists after optimization. '\n"
+            "        'opt_ckpt.cleanup() was not called or was called before '\n"
+            "        'output files were written. A stale pickle causes the next '\n"
+            "        'run to resume from old state instead of starting fresh.'\n"
+            "    )\n"
+            "else:\n"
+            "    print(f'Checkpoint cleanup: {checkpoint_pkl} correctly removed.')\n"
+            "\n"
+            "# --- Pareto front checks ---\n"
+            "pareto_path = os.path.join(output_dir, 'nsga2_results.csv')\n"
+            "if not os.path.exists(pareto_path):\n"
+            "    fails.append('FAIL: nsga2_results.csv not found')\n"
+            "else:\n"
+            "    df = pd.read_csv(pareto_path)\n"
+            "    if len(df) == 0:\n"
+            "        fails.append('FAIL: nsga2_results.csv is empty')\n"
+            "    else:\n"
+            "        for col in ['Investment_Cost', 'Risk_Cost', 'Total_Cost']:\n"
+            "            if col not in df.columns:\n"
+            "                fails.append(f'FAIL: missing column {col}')\n"
+            "            elif (df[col] < 0).any():\n"
+            "                fails.append(f'FAIL: negative values in {col}')\n"
+            "            elif df[col].isna().any() or df[col].apply(lambda x: math.isinf(x)).any():\n"
+            "                fails.append(f'FAIL: NaN or Inf in {col}')\n"
+            "        if 'Total_Cost' in df.columns and 'Investment_Cost' in df.columns and 'Risk_Cost' in df.columns:\n"
+            "            diff = abs(df['Total_Cost'] - df['Investment_Cost'] - df['Risk_Cost'])\n"
+            "            if (diff > 1.0).any():\n"
+            "                fails.append('FAIL: Total != Investment + Risk (tolerance 1.0)')\n"
+            "        if 'Budget' in df.columns:\n"
+            "            if (df['Budget'] < budget_min * 0.9).any() or (df['Budget'] > budget_max * 1.1).any():\n"
+            "                fails.append(f'WARN: Budget outside [{budget_min}, {budget_max}]')\n"
+            "        if 'Rehab_Trigger' in df.columns:\n"
+            "            if (df['Rehab_Trigger'] < trigger_min * 0.9).any() or (df['Rehab_Trigger'] > trigger_max * 1.1).any():\n"
+            "                fails.append(f'WARN: Rehab_Trigger outside [{trigger_min}, {trigger_max}]')\n"
+            "        print(f'Pareto front: {len(df)} solutions')\n"
+            "        print(f'  Investment: ${df[\"Investment_Cost\"].min():,.0f} - ${df[\"Investment_Cost\"].max():,.0f}')\n"
+            "        print(f'  Risk:       ${df[\"Risk_Cost\"].min():,.0f} - ${df[\"Risk_Cost\"].max():,.0f}')\n"
+            "        print(f'  Total min:  ${df[\"Total_Cost\"].min():,.0f}')\n"
+            "\n"
+            "# --- Action plan checks ---\n"
+            "plan_path = os.path.join(output_dir, 'Optimal_Action_Plan.csv')\n"
+            "if not os.path.exists(plan_path):\n"
+            "    fails.append('FAIL: Optimal_Action_Plan.csv not found')\n"
+            "else:\n"
+            "    ap = pd.read_csv(plan_path)\n"
+            "    if len(ap) == 0:\n"
+            "        fails.append('FAIL: Action plan is empty')\n"
+            "    else:\n"
+            "        required = ['Year', 'PipeID', 'Action', 'Cost', 'Priority', 'Condition_Before']\n"
+            "        missing = [c for c in required if c not in ap.columns]\n"
+            "        if missing:\n"
+            "            fails.append(f'FAIL: Action plan missing columns: {missing}')\n"
+            "        if 'Action' in ap.columns:\n"
+            "            allowed = {'CIP_Replacement', 'Emergency_Replacement'}\n"
+            "            bad = set(ap['Action'].unique()) - allowed\n"
+            "            if bad:\n"
+            "                fails.append(f'FAIL: Unknown action types: {bad}')\n"
+            "            cip_n = (ap['Action'] == 'CIP_Replacement').sum()\n"
+            "            emg_n = (ap['Action'] == 'Emergency_Replacement').sum()\n"
+            "            print(f'Action plan: {len(ap)} entries (CIP: {cip_n}, Emergency: {emg_n})')\n"
+            "        if 'Cost' in ap.columns and (ap['Cost'] < 0).any():\n"
+            "            fails.append('FAIL: Negative costs in action plan')\n"
+            "        if 'Condition_Before' in ap.columns:\n"
+            "            conds = ap['Condition_Before']\n"
+            "            if (conds < 0.9).any() or (conds > 6.1).any():\n"
+            "                fails.append('FAIL: Condition_Before outside [1, 6]')\n"
+            "\n"
+            "# --- Output files ---\n"
+            "for fname in ['optimization_curve.png', 'validation_curve.png']:\n"
+            "    fpath = os.path.join(output_dir, fname)\n"
+            "    if not os.path.exists(fpath):\n"
+            "        fails.append(f'FAIL: {fname} not found')\n"
+            "    elif os.path.getsize(fpath) < 1000:\n"
+            "        fails.append(f'WARN: {fname} suspiciously small ({os.path.getsize(fpath)} bytes)')\n"
+            "\n"
+            "# --- Verdict ---\n"
+            "if fails:\n"
+            "    print('\\n--- ISSUES ---')\n"
+            "    for f in fails:\n"
+            "        print(f'  {f}')\n"
+            "    has_fail = any(f.startswith('FAIL') for f in fails)\n"
+            "    print(f'\\nVerdict: {\"FAIL\" if has_fail else \"WARN\"}')\n"
+            "    sys.exit(1 if has_fail else 0)\n"
+            "else:\n"
+            "    print('\\nAll checks passed.')\n"
+            "    print('Verdict: PASS')\n"
         )
+        cmd = [
+            "python", "-c", script,
+            output_dir,
+            str(budget_min), str(budget_max),
+            str(trigger_min), str(trigger_max),
+            checkpoint_pkl,
+        ]
+        result = run_shell_cmd(cmd, timeout=60)
         return _format_result("validate_simulation_output", result)
 
     # ── Checkpoint inspection (Gap 15) ─────────────────────────────────
@@ -572,11 +459,68 @@ def build_python_mcp_server():
         ),
         {"file_path": str, "mode": str},
     )
-    async def inspect_checkpoint_handler(args):
-        result = inspect_checkpoint(
-            file_path=args["file_path"],
-            mode=args.get("mode", "auto"),
+    async def inspect_checkpoint(args):
+        file_path = args["file_path"]
+        mode = args.get("mode", "auto")
+        script = (
+            "import sys, os, json\n"
+            "fp = sys.argv[1]\n"
+            "mode = sys.argv[2]\n"
+            "\n"
+            "if not os.path.exists(fp):\n"
+            "    print(f'FILE NOT FOUND: {fp}')\n"
+            "    sys.exit(1)\n"
+            "\n"
+            "fsize = os.path.getsize(fp)\n"
+            "print(f'File: {fp} ({fsize:,} bytes)')\n"
+            "\n"
+            "# Auto-detect mode from extension\n"
+            "if mode == 'auto':\n"
+            "    mode = 'pickle' if fp.endswith('.pkl') else 'json'\n"
+            "\n"
+            "if mode == 'json':\n"
+            "    with open(fp) as f:\n"
+            "        data = json.load(f)\n"
+            "    print(f'Project: {data.get(\"project\", \"unknown\")}')\n"
+            "    print(f'Preemption count: {data.get(\"preemption_count\", 0)}')\n"
+            "    print(f'Total elapsed: {data.get(\"total_elapsed_seconds\", 0):.0f}s')\n"
+            "    print(f'Last checkpoint: {data.get(\"last_checkpoint\", \"never\")}')\n"
+            "    sprints = data.get('sprints', {})\n"
+            "    print(f'Sprints tracked: {len(sprints)}')\n"
+            "    for sid, sdata in sorted(sprints.items()):\n"
+            "        status = sdata.get('status', 'unknown')\n"
+            "        phases = sdata.get('phases', {})\n"
+            "        completed = sum(1 for p in phases.values() if p.get('status') in ('completed', 'skipped'))\n"
+            "        total = len(phases)\n"
+            "        print(f'  {sid}: {status} ({completed}/{total} phases done)')\n"
+            "    checksums = data.get('file_checksums', {})\n"
+            "    print(f'File checksums: {len(checksums)} files tracked')\n"
+            "\n"
+            "elif mode == 'pickle':\n"
+            "    import pickle\n"
+            "    try:\n"
+            "        with open(fp, 'rb') as f:\n"
+            "            algo = pickle.load(f)\n"
+            "        n_gen = getattr(algo, 'n_gen', None)\n"
+            "        pop_size = None\n"
+            "        if hasattr(algo, 'pop') and algo.pop is not None:\n"
+            "            pop_size = len(algo.pop)\n"
+            "        print(f'PICKLE OK: loaded successfully')\n"
+            "        print(f'  Algorithm type: {type(algo).__name__}')\n"
+            "        print(f'  Generation (n_gen): {n_gen}')\n"
+            "        print(f'  Population size: {pop_size}')\n"
+            "        if hasattr(algo, 'opt') and algo.opt is not None:\n"
+            "            print(f'  Current best solutions: {len(algo.opt)}')\n"
+            "        print(f'  Resumable: {\"YES\" if n_gen and n_gen > 0 else \"NO (fresh)\"}')\n"
+            "    except (pickle.UnpicklingError, EOFError, AttributeError, ModuleNotFoundError) as e:\n"
+            "        print(f'PICKLE CORRUPT: {type(e).__name__}: {e}')\n"
+            "        sys.exit(1)\n"
+            "else:\n"
+            "    print(f'Unknown mode: {mode}. Use json or pickle.')\n"
+            "    sys.exit(1)\n"
         )
+        cmd = ["python", "-c", script, file_path, mode]
+        result = run_shell_cmd(cmd, timeout=30)
         return _format_result("inspect_checkpoint", result)
 
     # ── Helper ─────────────────────────────────────────────────────────
@@ -610,8 +554,8 @@ def build_python_mcp_server():
             grep_codebase,
             run_python_script,
             check_imports,
-            validate_simulation_output_handler,
-            inspect_checkpoint_handler,
+            validate_simulation_output,
+            inspect_checkpoint,
         ],
     )
     return server

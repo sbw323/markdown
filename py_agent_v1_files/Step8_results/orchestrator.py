@@ -56,7 +56,6 @@ import os
 import sys
 import textwrap
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +63,6 @@ import anthropic
 
 from config.checkpoint import (
     CheckpointManager,
-    CheckpointState,
     EXIT_INTEGRITY,
     EXIT_PREEMPTED,
     install_preemption_handler,
@@ -405,16 +403,6 @@ def _tool_read_file(args: dict, root: Path) -> str:
     path = _resolve(args["path"], root)
     if not path.exists():
         return f"ERROR: File not found: {path}"
-
-    # Guard against reading very large files into memory
-    file_size = path.stat().st_size
-    if file_size > 500_000:  # 500 KB
-        return (
-            f"ERROR: File too large ({file_size:,} bytes): {args['path']}. "
-            f"Use inspect_csv for CSV files, or grep_codebase to search "
-            f"for specific content."
-        )
-
     try:
         content = path.read_text()
         lines = content.splitlines()
@@ -463,12 +451,6 @@ def _tool_delete_file(args: dict, root: Path) -> str:
     path = _resolve(args["path"], root)
     if path.exists():
         path.unlink()
-        # Note: checkpoint file_checksums is not updated here.
-        # The stale entry is resolved at sprint completion when
-        # mark_sprint_completed() recomputes all checksums.
-        # If preemption occurs before sprint completion, the
-        # integrity check correctly identifies this sprint for
-        # re-run, which will re-delete the file.
         return f"OK: Deleted {args['path']}."
     return f"OK: {args['path']} does not exist (already deleted)."
 
@@ -557,8 +539,8 @@ def _tool_shell(name: str, args: dict, root: Path) -> str:
         script = (
             f"import {module}\n"
             f"attrs = [a for a in dir({module}) if not a.startswith('_')]\n"
-            f"print('OK: {module} imported successfully')\n"
-            "print('Public attributes ({n}): {a}'.format(n=len(attrs), a=attrs))\n"
+            f"print(f'OK: {module} imported successfully')\n"
+            f"print(f'Public attributes ({{len(attrs)}}): {{attrs}}')\n"
         )
         cmd = ["python", "-c", script]
         timeout = 30
@@ -1001,9 +983,10 @@ def main() -> int:
 
     if args.fresh:
         logger.info("--fresh flag: ignoring existing checkpoint.")
-        mgr.state = CheckpointState(
-            project=mgr.project_name,
-            start_time=datetime.now(timezone.utc).isoformat(),
+        mgr.state.start_time = (
+            __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).isoformat()
         )
     else:
         mgr.load()

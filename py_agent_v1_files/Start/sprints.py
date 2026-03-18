@@ -629,7 +629,7 @@ DOCUMENTATION — Update README.md:
         skip_phases=[SprintPhase.UNIT_TEST],
         max_turns_per_phase={
             SprintPhase.PLAN: 8, SprintPhase.GENERATE: 40,
-            SprintPhase.STATIC: 10,
+            SprintPhase.STATIC: 10, SprintPhase.UNIT_TEST: 0,
             SprintPhase.INTEGRATE: 20, SprintPhase.VERIFY: 15,
             SprintPhase.PACKAGE: 5,
         },
