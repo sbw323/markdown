@@ -1,6 +1,7 @@
+#!/bin/bash
 exec > /var/log/gce-startup-script.log 2>&1
 set -x
-echo "Starting VM initialization: GUI, MATLAB/Simulink, and Python..."
+echo "Starting VM initialization: GUI, and MATLAB R2025b..."
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
@@ -32,23 +33,34 @@ apt-get install -y wget curl unzip git xvfb ca-certificates \
     libnss3 libpango-1.0-0 libpangocairo-1.0-0
 
 # ---------------------------------------------------------
-# STEP 3: AUTOMATICALLY DOWNLOAD & INSTALL MATLAB
+# STEP 3: AUTOMATICALLY DOWNLOAD & INSTALL MATLAB R2025b
 # ---------------------------------------------------------
-echo "Downloading MPM and Installing MATLAB (R2026a)..."
+echo "Downloading MPM and Installing MATLAB (R2025b)..."
 mkdir -p /opt/mathworks
 cd /opt/mathworks
 wget -q https://www.mathworks.com/mpm/glnxa64/mpm
 chmod +x mpm
 
-# Installing the latest release with the Parallel Computing Toolbox
-MATLAB_RELEASE="R2026a"
+MATLAB_RELEASE="R2025b"
 MATLAB_DIR="/usr/local/MATLAB/$MATLAB_RELEASE"
+
+# Explicitly create the directory structure before installation
+mkdir -p $MATLAB_DIR
 
 ./mpm install \
     --release=$MATLAB_RELEASE \
     --destination=$MATLAB_DIR \
     --products MATLAB Simulink Parallel_Computing_Toolbox
 
-ln -s $MATLAB_DIR/bin/matlab /usr/local/bin/matlab
+# ---------------------------------------------------------
+# STEP 4: PERMISSION FIX & PATHING
+# ---------------------------------------------------------
+echo "Applying user permissions and system paths..."
+
+# Grant the RDP user full ownership to allow GUI license activation
+chown -R highview19:highview19 /usr/local/MATLAB
+
+# Create the global executable link
+ln -sf $MATLAB_DIR/bin/matlab /usr/local/bin/matlab
 
 echo "Startup script completed successfully!"

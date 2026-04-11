@@ -1,0 +1,36 @@
+{
+  "paper_id": "Stare et al. - 2007 - Comparison of control strategies for nitrogen removal in an activated sludge process in terms of ope",
+  "title": "Comparison of control strategies for nitrogen removal in an activated sludge process in terms of operating costs: A simulation study",
+  "authors": [
+    "A. Stare",
+    "D. Vrečko",
+    "N. Hvala",
+    "S. Strmčnik"
+  ],
+  "year": 2007,
+  "objective": "To evaluate and compare different control strategies for nitrogen removal in activated sludge processes in terms of operating costs using benchmark simulation models. The study aims to determine which control strategy delivers better performance with respect to plant operating costs while maintaining effluent quality standards.",
+  "methodology": "The study used a benchmark simulation model of an activated sludge process with ASM1 biological model and compared five control strategies: constant manipulated variables, oxygen PI control, nitrate and ammonia PI control, nitrate PI and ammonia feedforward-PI control, and model predictive control (MPC). Operational maps were constructed for each strategy to determine optimal set-points, and performance was evaluated under various plant operating conditions.",
+  "key_equations": [
+    "OC = g_1 \\cdot AE + g_2 \\cdot SP + g_3 \\cdot EC + EF",
+    "AE = \\frac{1}{T} \\sum_{t=0}^{T-1} \\sum_{i=1}^{5} \\frac{K_{La_i}(t) \\cdot V_i}{V_{ref}} \\cdot S_{O_{sat}} \\cdot 24",
+    "SP = \\frac{1}{T} \\sum_{t=0}^{T-1} [X_{TSS}(t) \\cdot Q_w(t)] + \\frac{M_{TSS_{system}}(T) - M_{TSS_{system}}(0)}{T}",
+    "S_{o_{set}} = S_{o_{PI}} + S_{o_{FF}}",
+    "S_{o_{FF}} = \\begin{cases} k \\cdot Q_{in} \\cdot S_{NH_{in}} & \\text{if } Q_{in} \\cdot S_{NH_{in}} > n_{load} \\\\ 0 & \\text{otherwise} \\end{cases}",
+    "J = \\sum_{i=1}^{H_p} [\\hat{y}(k+i) - r(k+i)]^T Q [\\hat{y}(k+i) - r(k+i)] + \\sum_{i=0}^{H_u-1} \\Delta u(k+i)^T R_{\\Delta u} \\Delta u(k+i) + \\sum_{i=0}^{H_p-1} [u(k+i) - u_0]^T R_u [u(k+i) - u_0] + \\sum_{i=1}^{H_p} \\varepsilon(k+i)^T \\rho \\varepsilon(k+i)"
+  ],
+  "key_findings": [
+    "Simple PI and feedforward controllers achieved nearly the same optimal operating costs as advanced MPC algorithms under various plant operating conditions, with only 1% difference in cost reduction between nitrate PI/ammonia FF-PI control (11.8% cost reduction) and MPC (12.6% cost reduction).",
+    "Oxygen PI control alone provided significant cost savings of approximately 7% (203 €/day or 74,000 €/year) compared to constant manipulated variables, requiring only basic DO sensors.",
+    "Advanced control algorithms are advantageous only when the plant is highly loaded and stringent effluent fines are imposed by legislation, as the improvement is more related to control structure (sensor and actuator placement) than algorithm complexity.",
+    "Control strategies using online nitrate and ammonia measurements showed better performance and were less sensitive to optimal set-point selection across wider ranges of operating conditions.",
+    "The benchmark plant configuration with relatively small reactor volumes for the given influent load was a limiting factor for achieving greater operating cost reductions regardless of control strategy complexity."
+  ],
+  "limitations": "The results are based on simulation models which are approximations of real processes, and the ideal MPC used perfect measurements and complete knowledge of disturbances. Investment and maintenance costs for sensors and actuators, as well as sensor failure scenarios, were not considered in the economic evaluation.",
+  "relevance_tags": [
+    "wastewater treatment",
+    "activated sludge process",
+    "nitrogen removal",
+    "process control",
+    "model predictive control"
+  ]
+}
