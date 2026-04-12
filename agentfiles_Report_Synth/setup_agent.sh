@@ -67,7 +67,7 @@ FRAMEWORK_FILES=(
     "tools.py"
     "prompts.py"
     "sprints.py"
-    "orchestrator.py"
+    "run_sprints.py"
     "report_synthesizer_v4.md"
 )
 
@@ -415,7 +415,7 @@ for imp, pip_name in required.items():
 
 # ── Required: framework modules (from workspace) ──
 sys.path.insert(0, '${WORKSPACE_DIR}')
-for mod in ['tools', 'sprints', 'prompts']:
+for mod in ['tools', 'sprints', 'prompts', 'run_sprints']:
     try:
         __import__(mod)
     except Exception as e:
@@ -481,7 +481,7 @@ echo ""
 echo "  Directory tree:"
 echo ""
 echo "  workspace/lit_review_pipeline/"
-echo "  ├── config.py, tools.py, prompts.py, sprints.py, orchestrator.py"
+echo "  ├── config.py, tools.py, prompts.py, sprints.py, run_sprints.py"
 echo "  ├── 01_ingest.py .. 06_review.py"
 echo "  ├── report_synthesizer_v4.md"
 echo "  ├── .env"
@@ -526,8 +526,14 @@ else
 echo "    (Docker not available — install Docker first)"
 fi
 echo ""
-echo "  To run sprint generation (after pipeline completes):"
-echo "    python -c \"import prompts; print(prompts.build_prompt_for_sprint('sprint_1'))\""
+echo "  To run the programmer agent (all 6 sprints → synthesizer code):"
+echo "    python run_sprints.py"
+echo ""
+echo "  Other run_sprints.py options:"
+echo "    python run_sprints.py --dry-run              # preview prompts only"
+echo "    python run_sprints.py --sprint sprint_1      # run a single sprint"
+echo "    python run_sprints.py --start-from sprint_3  # resume from sprint 3"
+echo "    python run_sprints.py --model claude-opus-4-20250514"
 echo ""
 echo "  Drop your PDFs into:"
 echo "    ${WORKSPACE_DIR}/data/pdfs/"
